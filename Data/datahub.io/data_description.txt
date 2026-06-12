@@ -1,0 +1,23 @@
+Field	        Type	           Description
+Date	        date	           Match Date (YYYY-MM-DD)
+HomeTeam	    string	           Home Team
+AwayTeam	    string	           Away Team
+FTHG	        integer            Full Time Home Team Goals
+FTAG	        integer            Full Time Away Team Goals
+FTR	            string	           Full Time Result (H=Home Win, D=Draw, A=Away Win)
+HTHG	        integer            Half Time Home Team Goals
+HTAG	        integer            Half Time Away Team Goals
+HTR	            string	           Half Time Result (H=Home Win, D=Draw, A=Away Win)
+Referee	        string             Match Referee
+HS	            integer            Home Team Shots
+AS	            integer            Away Team Shots
+HST	            integer            Home Team Shots on Target
+AST	            integer            Away Team Shots on Target
+HF	            integer            Home Team Fouls Committed
+AF	            integer            Away Team Fouls Committed
+HC	            integer            Home Team Corners
+AC	            integer            Away Team Corners
+HY	            integer            Home Team Yellow Cards
+AY	            integer            Away Team Yellow Cards
+HR	            integer            Home Team Red Cards
+AR	            integer            Away Team Red Cards

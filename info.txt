@@ -1,0 +1,1 @@
+Bayesian modeling of football league standings based on historical performance data
