@@ -249,6 +249,55 @@ def prepare_table_stan_hierarchical(
     return stan_data, team_to_idx, teams, season_to_idx, feature_stats
 
 
+def ppc_table_replicates(
+    fit,
+    stan_data: dict,
+    *,
+    model: str = "static",
+    nu: float | None = None,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Posterior predictive replicates of team-season points.
+
+    Returns array with shape (n_draws, N).
+    """
+    if model not in {"static", "hierarchical"}:
+        raise ValueError("model must be 'static' or 'hierarchical'")
+
+    nu = STUDENT_T_NU if nu is None else nu
+    rng = np.random.default_rng(seed)
+
+    intercept = fit.stan_variable("intercept")
+    beta_sot = fit.stan_variable("beta_sot")
+    beta_lag = fit.stan_variable("beta_lag")
+    beta_form = fit.stan_variable("beta_form")
+    sigma_pts = fit.stan_variable("sigma_pts")
+    skill = fit.stan_variable("skill")
+
+    team_idx = np.asarray(stan_data["team"], dtype=int) - 1
+    sot = np.asarray(stan_data["sot_diff_pg"], dtype=float)
+    lag = np.asarray(stan_data["pts_lag1"], dtype=float)
+    form = np.asarray(stan_data["ppg_last10"], dtype=float)
+
+    if model == "static":
+        beta_pts = fit.stan_variable("beta_pts")
+        sk = beta_pts[:, None] * skill[:, team_idx]
+    else:
+        season_idx = np.asarray(stan_data["season"], dtype=int) - 1
+        sk = skill[:, season_idx, team_idx]
+
+    mu = (
+        intercept[:, None]
+        + sk
+        + beta_sot[:, None] * sot[None, :]
+        + beta_lag[:, None] * lag[None, :]
+        + beta_form[:, None] * form[None, :]
+    )
+    noise = sigma_pts[:, None] * rng.standard_t(nu, size=mu.shape)
+    return mu + noise
+
+
 def predict_table(
     fit,
     teams: list[str],
@@ -278,7 +327,6 @@ def predict_table(
 
     rng = np.random.default_rng(seed)
     intercept = fit.stan_variable("intercept")
-    beta_pts = fit.stan_variable("beta_pts")
     beta_sot = fit.stan_variable("beta_sot")
     beta_lag = fit.stan_variable("beta_lag")
     beta_form = fit.stan_variable("beta_form")
@@ -286,6 +334,9 @@ def predict_table(
     n_draws = intercept.shape[0]
 
     skill_draws = fit.stan_variable("skill")
+    beta_pts_draws = (
+        fit.stan_variable("beta_pts") if model == "static" else None
+    )
     s_idx = (last_season_index - 1) if model == "hierarchical" else None
 
     position_records = {t: [] for t in teams}
@@ -298,16 +349,16 @@ def predict_table(
             if team in team_to_idx:
                 j = team_to_idx[team] - 1
                 if model == "static":
-                    skill = skill_draws[d, j]
+                    team_skill = beta_pts_draws[d] * skill_draws[d, j]
                 else:
-                    skill = skill_draws[d, s_idx, j]
+                    team_skill = skill_draws[d, s_idx, j]
             else:
-                skill = 0.0
+                team_skill = 0.0
 
             feat = (team_features or {}).get(team, zero_feat)
             mu = (
                 intercept[d]
-                + beta_pts[d] * skill
+                + team_skill
                 + beta_sot[d] * feat["sot_diff_pg"]
                 + beta_lag[d] * feat["pts_lag1"]
                 + beta_form[d] * feat["ppg_last10"]
