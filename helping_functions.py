@@ -19,6 +19,7 @@ def load_matches(data_path: Path | None = None) -> pd.DataFrame:
         frames.append(df)
     matches = pd.concat(frames, ignore_index=True)
     matches["Date"] = pd.to_datetime(matches["Date"])
+    matches["total_goals"] = matches["FTHG"] + matches["FTAG"]
     return matches
 
 

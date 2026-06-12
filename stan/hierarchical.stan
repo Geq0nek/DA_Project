@@ -34,8 +34,10 @@ transformed parameters {
 
 model {
   home_adv ~ normal(0.3, 0.3);
-  sigma_att ~ exponential(1);
-  sigma_def ~ exponential(1);
+  // Half-normal: team log-rate spreads in EPL are modest (~0.2–0.4);
+  // Exp(1) was too diffuse (prior predictive heavy tail — see notebook 03).
+  sigma_att ~ normal(0, 0.4) T[0,];
+  sigma_def ~ normal(0, 0.4) T[0,];
   to_vector(att_z) ~ std_normal();
   to_vector(def_z) ~ std_normal();
 
