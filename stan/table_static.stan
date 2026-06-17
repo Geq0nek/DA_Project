@@ -18,13 +18,12 @@ parameters {
   real beta_sot;
   real beta_lag;
   real beta_form;
-  real log_sigma_pts;
-  vector[T] skill_raw;
+  real<lower=log(0.5), upper=log(30)> log_sigma_pts;
+  sum_to_zero_vector[T] skill;
 }
 
 transformed parameters {
   real sigma_pts = exp(log_sigma_pts);
-  vector[T] skill = skill_raw - mean(skill_raw);
 }
 
 model {
@@ -34,7 +33,7 @@ model {
   beta_lag ~ normal(0, 0.5);
   beta_form ~ normal(0, 8);
   log_sigma_pts ~ normal(log(17), 0.3);
-  skill_raw ~ std_normal();
+  skill ~ std_normal();
 
   for (n in 1:N) {
     real mu = intercept

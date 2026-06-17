@@ -128,8 +128,13 @@ def load_season_tables(
     seasons: Iterable[str],
     *,
     with_features: bool = True,
+    lag_features: bool = True,
 ) -> pd.DataFrame:
-    """Long-format league tables: one row per (season, team), optional process features."""
+    """Long-format league tables: one row per (season, team), optional process features.
+
+    With lag_features=True, features for target season s are taken from season s-1.
+    That avoids leaking same-season shots/form into a pre-season table forecast.
+    """
     ordered = sorted(seasons)
     frames = []
     pts_lookup: dict[tuple[str, str], float] = {}
@@ -144,11 +149,50 @@ def load_season_tables(
     if not with_features:
         return tables
 
-    feat_frames = [
+    raw_feat_frames = [
         compute_team_season_features(matches, season, ordered, pts_lookup)
         for season in ordered
     ]
-    features = pd.concat(feat_frames, ignore_index=True)
+    raw_features = pd.concat(raw_feat_frames, ignore_index=True)
+
+    if not lag_features:
+        return tables.merge(raw_features, on=["season", "team"], how="left")
+
+    raw_by_season_team = raw_features.set_index(["season", "team"])
+    rows = []
+    for _, row in tables[["season", "team"]].iterrows():
+        season = row["season"]
+        team = row["team"]
+        season_idx = ordered.index(season)
+        if season_idx == 0:
+            feature_row = {
+                "season": season,
+                "team": team,
+                "sot_diff_pg": 0.0,
+                "pts_lag1": 0.0,
+                "ppg_last10": 0.0,
+            }
+        else:
+            prev_season = ordered[season_idx - 1]
+            if (prev_season, team) in raw_by_season_team.index:
+                prev = raw_by_season_team.loc[(prev_season, team)]
+                feature_row = {
+                    "season": season,
+                    "team": team,
+                    "sot_diff_pg": float(prev["sot_diff_pg"]),
+                    "pts_lag1": float(pts_lookup.get((prev_season, team), 0.0)),
+                    "ppg_last10": float(prev["ppg_last10"]),
+                }
+            else:
+                feature_row = {
+                    "season": season,
+                    "team": team,
+                    "sot_diff_pg": 0.0,
+                    "pts_lag1": 0.0,
+                    "ppg_last10": 0.0,
+                }
+        rows.append(feature_row)
+    features = pd.DataFrame(rows)
     return tables.merge(features, on=["season", "team"], how="left")
 
 
@@ -167,6 +211,7 @@ def build_forecast_features(
     ordered = list(ordered_seasons)
     feat = compute_team_season_features(matches, feature_season, ordered)
     feat = feat.set_index("team")
+    pts_last = compute_table(matches, feature_season).set_index("team")["Pts"]
     raw_rows = []
     for team in teams:
         if team in feat.index:
@@ -174,7 +219,7 @@ def build_forecast_features(
             raw_rows.append({
                 "team": team,
                 "sot_diff_pg": float(row["sot_diff_pg"]),
-                "pts_lag1": float(row["pts_lag1"]),
+                "pts_lag1": float(pts_last.get(team, 0.0)),
                 "ppg_last10": float(row["ppg_last10"]),
             })
         else:
@@ -233,13 +278,19 @@ def prepare_table_stan_hierarchical(
     team_to_idx = {name: i + 1 for i, name in enumerate(teams)}
 
     train, feature_stats = _standardize_features(train)
+    train["obs_pos"] = train.groupby("season").cumcount() + 1
+    season_counts = train.groupby("season").size()
+    if season_counts.nunique() != 1:
+        raise ValueError("table_hierarchical.stan expects equal teams per season")
 
     stan_data = {
         "N": len(train),
         "S": len(ordered_seasons),
         "T": len(teams),
+        "K": int(season_counts.iloc[0]),
         "nu": STUDENT_T_NU,
         "season": train["season"].map(season_to_idx).astype(int).to_numpy(),
+        "obs_pos": train["obs_pos"].astype(int).to_numpy(),
         "team": train["team"].map(team_to_idx).astype(int).to_numpy(),
         "pts": train["Pts"].astype(float).to_numpy(),
         "sot_diff_pg": train["sot_diff_pg"].astype(float).to_numpy(),
