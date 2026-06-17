@@ -171,6 +171,7 @@ def load_season_tables(
                 "sot_diff_pg": 0.0,
                 "pts_lag1": 0.0,
                 "ppg_last10": 0.0,
+                "is_promoted": 0,
             }
         else:
             prev_season = ordered[season_idx - 1]
@@ -182,6 +183,7 @@ def load_season_tables(
                     "sot_diff_pg": float(prev["sot_diff_pg"]),
                     "pts_lag1": float(pts_lookup.get((prev_season, team), 0.0)),
                     "ppg_last10": float(prev["ppg_last10"]),
+                    "is_promoted": 0,
                 }
             else:
                 feature_row = {
@@ -190,6 +192,7 @@ def load_season_tables(
                     "sot_diff_pg": 0.0,
                     "pts_lag1": 0.0,
                     "ppg_last10": 0.0,
+                    "is_promoted": 1,
                 }
         rows.append(feature_row)
     features = pd.DataFrame(rows)
@@ -221,6 +224,7 @@ def build_forecast_features(
                 "sot_diff_pg": float(row["sot_diff_pg"]),
                 "pts_lag1": float(pts_last.get(team, 0.0)),
                 "ppg_last10": float(row["ppg_last10"]),
+                "is_promoted": 0,
             })
         else:
             raw_rows.append({
@@ -228,6 +232,7 @@ def build_forecast_features(
                 "sot_diff_pg": feature_stats["sot_diff_pg"][0],
                 "pts_lag1": feature_stats["pts_lag1"][0],
                 "ppg_last10": feature_stats["ppg_last10"][0],
+                "is_promoted": 1,
             })
     raw_df = pd.DataFrame(raw_rows)
     z_df, _ = _standardize_features(raw_df, stats=feature_stats)
@@ -236,6 +241,7 @@ def build_forecast_features(
             "sot_diff_pg": float(row["sot_diff_pg"]),
             "pts_lag1": float(row["pts_lag1"]),
             "ppg_last10": float(row["ppg_last10"]),
+            "is_promoted": float(row["is_promoted"]),
         }
         for _, row in z_df.iterrows()
     }
@@ -261,6 +267,7 @@ def prepare_table_stan_static(
         "sot_diff_pg": train["sot_diff_pg"].astype(float).to_numpy(),
         "pts_lag1": train["pts_lag1"].astype(float).to_numpy(),
         "ppg_last10": train["ppg_last10"].astype(float).to_numpy(),
+        "is_promoted": train["is_promoted"].astype(int).to_numpy(),
     }
     return stan_data, team_to_idx, teams, feature_stats
 
@@ -296,6 +303,7 @@ def prepare_table_stan_hierarchical(
         "sot_diff_pg": train["sot_diff_pg"].astype(float).to_numpy(),
         "pts_lag1": train["pts_lag1"].astype(float).to_numpy(),
         "ppg_last10": train["ppg_last10"].astype(float).to_numpy(),
+        "is_promoted": train["is_promoted"].astype(int).to_numpy(),
     }
     return stan_data, team_to_idx, teams, season_to_idx, feature_stats
 
@@ -323,6 +331,7 @@ def ppc_table_replicates(
     beta_sot = fit.stan_variable("beta_sot")
     beta_lag = fit.stan_variable("beta_lag")
     beta_form = fit.stan_variable("beta_form")
+    beta_promoted = fit.stan_variable("beta_promoted")
     sigma_pts = fit.stan_variable("sigma_pts")
     skill = fit.stan_variable("skill")
 
@@ -330,6 +339,7 @@ def ppc_table_replicates(
     sot = np.asarray(stan_data["sot_diff_pg"], dtype=float)
     lag = np.asarray(stan_data["pts_lag1"], dtype=float)
     form = np.asarray(stan_data["ppg_last10"], dtype=float)
+    promoted = np.asarray(stan_data["is_promoted"], dtype=float)
 
     if model == "static":
         beta_pts = fit.stan_variable("beta_pts")
@@ -344,6 +354,7 @@ def ppc_table_replicates(
         + beta_sot[:, None] * sot[None, :]
         + beta_lag[:, None] * lag[None, :]
         + beta_form[:, None] * form[None, :]
+        + beta_promoted[:, None] * promoted[None, :]
     )
     noise = sigma_pts[:, None] * rng.standard_t(nu, size=mu.shape)
     return mu + noise
@@ -374,13 +385,19 @@ def predict_table(
     if model == "hierarchical" and last_season_index is None:
         raise ValueError("last_season_index required for hierarchical model")
 
-    zero_feat = {"sot_diff_pg": 0.0, "pts_lag1": 0.0, "ppg_last10": 0.0}
+    zero_feat = {
+        "sot_diff_pg": 0.0,
+        "pts_lag1": 0.0,
+        "ppg_last10": 0.0,
+        "is_promoted": 0.0,
+    }
 
     rng = np.random.default_rng(seed)
     intercept = fit.stan_variable("intercept")
     beta_sot = fit.stan_variable("beta_sot")
     beta_lag = fit.stan_variable("beta_lag")
     beta_form = fit.stan_variable("beta_form")
+    beta_promoted = fit.stan_variable("beta_promoted")
     sigma_pts = fit.stan_variable("sigma_pts")
     n_draws = intercept.shape[0]
 
@@ -388,7 +405,12 @@ def predict_table(
     beta_pts_draws = (
         fit.stan_variable("beta_pts") if model == "static" else None
     )
-    s_idx = (last_season_index - 1) if model == "hierarchical" else None
+    team_skill_draws = (
+        fit.stan_variable("team_skill") if model == "hierarchical" else None
+    )
+    tau_season_draws = (
+        fit.stan_variable("tau_season") if model == "hierarchical" else None
+    )
 
     position_records = {t: [] for t in teams}
     points_records = {t: [] for t in teams}
@@ -396,15 +418,22 @@ def predict_table(
     for _ in range(n_sims):
         d = rng.integers(0, n_draws)
         sim_pts: dict[str, float] = {}
-        for team in teams:
+        if model == "hierarchical":
+            future_dev_z = rng.standard_normal(len(teams))
+            future_dev_z = future_dev_z - future_dev_z.mean()
+            future_dev = tau_season_draws[d] * future_dev_z
+        else:
+            future_dev = np.zeros(len(teams))
+
+        for team_pos, team in enumerate(teams):
             if team in team_to_idx:
                 j = team_to_idx[team] - 1
                 if model == "static":
                     team_skill = beta_pts_draws[d] * skill_draws[d, j]
                 else:
-                    team_skill = skill_draws[d, s_idx, j]
+                    team_skill = team_skill_draws[d, j] + future_dev[team_pos]
             else:
-                team_skill = 0.0
+                team_skill = future_dev[team_pos] if model == "hierarchical" else 0.0
 
             feat = (team_features or {}).get(team, zero_feat)
             mu = (
@@ -413,6 +442,7 @@ def predict_table(
                 + beta_sot[d] * feat["sot_diff_pg"]
                 + beta_lag[d] * feat["pts_lag1"]
                 + beta_form[d] * feat["ppg_last10"]
+                + beta_promoted[d] * feat.get("is_promoted", 0.0)
             )
             sim_pts[team] = mu + sigma_pts[d] * rng.standard_t(STUDENT_T_NU)
 

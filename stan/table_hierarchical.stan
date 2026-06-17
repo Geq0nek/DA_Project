@@ -15,6 +15,7 @@ data {
   array[N] real sot_diff_pg;
   array[N] real pts_lag1;
   array[N] real ppg_last10;
+  array[N] int<lower=0, upper=1> is_promoted;
 }
 
 parameters {
@@ -22,6 +23,7 @@ parameters {
   real beta_sot;
   real beta_lag;
   real beta_form;
+  real beta_promoted;
   real<lower=log(0.5), upper=log(20)> log_sigma_pts;
   real<lower=log(1), upper=log(25)> log_tau_team;
   real<lower=log(0.25), upper=log(15)> log_tau_season;
@@ -47,6 +49,7 @@ model {
   beta_sot ~ normal(0, 8);
   beta_lag ~ normal(0, 0.5);
   beta_form ~ normal(0, 8);
+  beta_promoted ~ normal(-10, 5);
   // Expert priors (points scale, Student-t nu=5 fixed in data):
   // sigma_pts: unpredictable season noise after skill + covariates (~4-6 pts SD equiv.).
   // tau_team: long-run residual team spread beyond process metrics (~6-10 pts SD).
@@ -64,7 +67,8 @@ model {
               + skill_obs[n]
               + beta_sot * sot_diff_pg[n]
               + beta_lag * pts_lag1[n]
-              + beta_form * ppg_last10[n];
+              + beta_form * ppg_last10[n]
+              + beta_promoted * is_promoted[n];
     pts[n] ~ student_t(nu, mu, sigma_pts);
   }
 }
@@ -80,7 +84,8 @@ generated quantities {
               + skill_obs[n]
               + beta_sot * sot_diff_pg[n]
               + beta_lag * pts_lag1[n]
-              + beta_form * ppg_last10[n];
+              + beta_form * ppg_last10[n]
+              + beta_promoted * is_promoted[n];
     skill[season[n], team[n]] = skill_obs[n];
     log_lik[n] = student_t_lpdf(pts[n] | nu, mu, sigma_pts);
   }
