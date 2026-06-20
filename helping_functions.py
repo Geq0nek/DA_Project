@@ -277,7 +277,12 @@ def prepare_table_stan_hierarchical(
     tables: pd.DataFrame,
     train_seasons: Iterable[str],
 ) -> tuple[dict, dict[str, int], list[str], dict[str, int], dict[str, tuple[float, float]]]:
-    """Stan data for team_hierarchical.stan from historical tables + features."""
+    """Stan data for team_hierarchical.stan from historical tables.
+
+    Model 2 intentionally excludes process/lag covariates from its likelihood;
+    they are still standardized and returned in ``feature_stats`` only because
+    shared forecasting helpers use the same feature-building path as Model 1.
+    """
     ordered_seasons = list(train_seasons)
     season_to_idx = {s: i + 1 for i, s in enumerate(ordered_seasons)}
 
@@ -295,9 +300,6 @@ def prepare_table_stan_hierarchical(
         "season": train["season"].map(season_to_idx).astype(int).to_numpy(),
         "team": train["team"].map(team_to_idx).astype(int).to_numpy(),
         "pts": train["Pts"].astype(float).to_numpy(),
-        "sot_diff_pg": train["sot_diff_pg"].astype(float).to_numpy(),
-        "pts_lag1": train["pts_lag1"].astype(float).to_numpy(),
-        "ppg_last10": train["ppg_last10"].astype(float).to_numpy(),
         "is_promoted": train["is_promoted"].astype(int).to_numpy(),
     }
     return stan_data, team_to_idx, teams, season_to_idx, feature_stats
@@ -323,34 +325,34 @@ def ppc_table_replicates(
     rng = np.random.default_rng(seed)
 
     intercept = fit.stan_variable("intercept")
-    beta_sot = fit.stan_variable("beta_sot")
-    beta_lag = fit.stan_variable("beta_lag")
-    beta_form = fit.stan_variable("beta_form")
+    beta_sot = fit.stan_variable("beta_sot") if model == "static" else None
+    beta_lag = fit.stan_variable("beta_lag") if model == "static" else None
+    beta_form = fit.stan_variable("beta_form") if model == "static" else None
     beta_promoted = fit.stan_variable("beta_promoted")
     sigma_pts = fit.stan_variable("sigma_pts")
     skill = fit.stan_variable("skill")
 
     team_idx = np.asarray(stan_data["team"], dtype=int) - 1
-    sot = np.asarray(stan_data["sot_diff_pg"], dtype=float)
-    lag = np.asarray(stan_data["pts_lag1"], dtype=float)
-    form = np.asarray(stan_data["ppg_last10"], dtype=float)
     promoted = np.asarray(stan_data["is_promoted"], dtype=float)
 
     if model == "static":
         beta_pts = fit.stan_variable("beta_pts")
+        sot = np.asarray(stan_data["sot_diff_pg"], dtype=float)
+        lag = np.asarray(stan_data["pts_lag1"], dtype=float)
+        form = np.asarray(stan_data["ppg_last10"], dtype=float)
         sk = beta_pts[:, None] * skill[:, team_idx]
     else:
         season_idx = np.asarray(stan_data["season"], dtype=int) - 1
         sk = skill[:, season_idx, team_idx]
 
-    mu = (
-        intercept[:, None]
-        + sk
-        + beta_sot[:, None] * sot[None, :]
-        + beta_lag[:, None] * lag[None, :]
-        + beta_form[:, None] * form[None, :]
-        + beta_promoted[:, None] * promoted[None, :]
-    )
+    mu = intercept[:, None] + sk + beta_promoted[:, None] * promoted[None, :]
+    if model == "static":
+        mu = (
+            mu
+            + beta_sot[:, None] * sot[None, :]
+            + beta_lag[:, None] * lag[None, :]
+            + beta_form[:, None] * form[None, :]
+        )
     noise = sigma_pts[:, None] * rng.standard_t(nu, size=mu.shape)
     return mu + noise
 
@@ -371,7 +373,8 @@ def predict_team_points(
     Model 1 (static): ``beta_pts * skill[team]`` — one latent strength over all seasons.
 
     Model 2 (hierarchical): long-run ``team_skill[team]`` plus a fresh
-    season-level effect ``tau_season * z`` for the forecast season.
+    season-level effect ``tau_season * z`` and promoted-team effect. It does
+    not use process/lag covariates.
 
     Returns summary stats and optional replicate array.
     """
@@ -388,9 +391,9 @@ def predict_team_points(
 
     rng = np.random.default_rng(seed)
     intercept = fit.stan_variable("intercept")
-    beta_sot = fit.stan_variable("beta_sot")
-    beta_lag = fit.stan_variable("beta_lag")
-    beta_form = fit.stan_variable("beta_form")
+    beta_sot = fit.stan_variable("beta_sot") if model == "static" else None
+    beta_lag = fit.stan_variable("beta_lag") if model == "static" else None
+    beta_form = fit.stan_variable("beta_form") if model == "static" else None
     beta_promoted = fit.stan_variable("beta_promoted")
     sigma_pts = fit.stan_variable("sigma_pts")
     n_draws = intercept.shape[0]
@@ -423,14 +426,14 @@ def predict_team_points(
             else:
                 team_skill = 0.0
 
-        mu = (
-            intercept[d]
-            + team_skill
-            + beta_sot[d] * feat["sot_diff_pg"]
-            + beta_lag[d] * feat["pts_lag1"]
-            + beta_form[d] * feat["ppg_last10"]
-            + beta_promoted[d] * feat.get("is_promoted", 0.0)
-        )
+        mu = intercept[d] + team_skill + beta_promoted[d] * feat.get("is_promoted", 0.0)
+        if model == "static":
+            mu = (
+                mu
+                + beta_sot[d] * feat["sot_diff_pg"]
+                + beta_lag[d] * feat["pts_lag1"]
+                + beta_form[d] * feat["ppg_last10"]
+            )
         sims[i] = mu + sigma_pts[d] * rng.standard_t(STUDENT_T_NU)
 
     return {
@@ -457,10 +460,55 @@ def build_predicted_table(
     Build a league table by predicting points for each team separately, then ranking.
 
     Each team is an independent model input; position comes from sorting predicted points.
-    Model 1 uses static ``beta_pts * skill``. Model 2 uses long-run
-    hierarchical ``team_skill`` plus a fresh common season-level effect for the
-    target season. Both also include Student-t predictive residual noise.
+    Model 1 uses static ``beta_pts * skill`` plus process/lag covariates.
+    Model 2 uses long-run hierarchical ``team_skill``, a fresh common
+    season-level effect for the target season, and promoted status only. Both
+    also include Student-t predictive residual noise.
     """
+    if model == "hierarchical":
+        rng = np.random.default_rng(seed)
+        intercept = fit.stan_variable("intercept")
+        beta_promoted = fit.stan_variable("beta_promoted")
+        sigma_pts = fit.stan_variable("sigma_pts")
+        team_skill_draws = fit.stan_variable("team_skill")
+        tau_season_draws = fit.stan_variable("tau_season")
+        n_draws = intercept.shape[0]
+
+        draw_idx = rng.integers(0, n_draws, size=n_sims)
+        season_effect = tau_season_draws[draw_idx] * rng.standard_normal(n_sims)
+
+        rows = []
+        for team in teams:
+            feat = (team_features or {}).get(team, {})
+            promoted = float(feat.get("is_promoted", 0.0))
+            if team in team_to_idx:
+                j = team_to_idx[team] - 1
+                skill = team_skill_draws[draw_idx, j]
+            else:
+                skill = 0.0
+
+            sims = (
+                intercept[draw_idx]
+                + skill
+                + season_effect
+                + beta_promoted[draw_idx] * promoted
+                + sigma_pts[draw_idx] * rng.standard_t(STUDENT_T_NU, size=n_sims)
+            )
+            rows.append({
+                "team": team,
+                "pts_median": float(np.median(sims)),
+                "pts_mean": float(np.mean(sims)),
+                "pts_q05": float(np.quantile(sims, 0.05)),
+                "pts_q95": float(np.quantile(sims, 0.95)),
+            })
+
+        summary = pd.DataFrame(rows).sort_values(
+            ["pts_median", "pts_mean"], ascending=False
+        )
+        summary["pos_median"] = np.arange(1, len(summary) + 1)
+        summary["pos_mean"] = summary["pts_mean"].rank(ascending=False, method="average")
+        return summary.reset_index(drop=True)
+
     rows = []
     for i, team in enumerate(teams):
         feat = (team_features or {}).get(team)
