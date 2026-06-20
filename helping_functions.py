@@ -209,7 +209,8 @@ def build_forecast_features(
     """
     Covariates for forecast teams from one reference season (z-scored).
 
-    Teams absent in feature_season get 0 on the z-scale (training mean).
+    Teams absent in feature_season use the same raw-zero convention as promoted
+    teams in training, then get z-scored with the training feature statistics.
     """
     ordered = list(ordered_seasons)
     feat = compute_team_season_features(matches, feature_season, ordered)
@@ -229,9 +230,9 @@ def build_forecast_features(
         else:
             raw_rows.append({
                 "team": team,
-                "sot_diff_pg": feature_stats["sot_diff_pg"][0],
-                "pts_lag1": feature_stats["pts_lag1"][0],
-                "ppg_last10": feature_stats["ppg_last10"][0],
+                "sot_diff_pg": 0.0,
+                "pts_lag1": 0.0,
+                "ppg_last10": 0.0,
                 "is_promoted": 1,
             })
     raw_df = pd.DataFrame(raw_rows)
@@ -369,9 +370,8 @@ def predict_team_points(
 
     Model 1 (static): ``beta_pts * skill[team]`` — one latent strength over all seasons.
 
-    Model 2 (hierarchical): ``team_skill[team] + tau_season * z`` with fresh
-    ``z ~ N(0, 1)`` for the forecast season (new season deviation, not the mean
-    of historical ``skill[s, team]``).
+    Model 2 (hierarchical): long-run ``team_skill[team]`` plus a fresh
+    season-level effect ``tau_season * z`` for the forecast season.
 
     Returns summary stats and optional replicate array.
     """
@@ -414,12 +414,12 @@ def predict_team_points(
             if model == "static":
                 team_skill = beta_pts_draws[d] * static_skill_draws[d, j]
             else:
-                season_dev = tau_season_draws[d] * rng.standard_normal()
-                team_skill = team_skill_draws[d, j] + season_dev
+                season_effect = tau_season_draws[d] * rng.standard_normal()
+                team_skill = team_skill_draws[d, j] + season_effect
         else:
             if model == "hierarchical":
-                season_dev = tau_season_draws[d] * rng.standard_normal()
-                team_skill = season_dev
+                season_effect = tau_season_draws[d] * rng.standard_normal()
+                team_skill = season_effect
             else:
                 team_skill = 0.0
 
@@ -457,8 +457,9 @@ def build_predicted_table(
     Build a league table by predicting points for each team separately, then ranking.
 
     Each team is an independent model input; position comes from sorting predicted points.
-    Model 1 uses static ``beta_pts * skill``; Model 2 uses ``team_skill + tau_season * z``
-    with a fresh season draw ``z`` per simulation.
+    Model 1 uses static ``beta_pts * skill``. Model 2 uses long-run
+    hierarchical ``team_skill`` plus a fresh common season-level effect for the
+    target season. Both also include Student-t predictive residual noise.
     """
     rows = []
     for i, team in enumerate(teams):
