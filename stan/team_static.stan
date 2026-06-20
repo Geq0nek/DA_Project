@@ -1,4 +1,4 @@
-// Model 1: static team strength — predict league points (Student-t likelihood)
+// Model 1 (team_static): static team strength — predict points for one team-season
 // Covariates (z-scored in Python): sot_diff_pg, pts_lag1, ppg_last10
 
 data {

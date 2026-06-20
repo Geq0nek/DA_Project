@@ -251,7 +251,7 @@ def prepare_table_stan_static(
     tables: pd.DataFrame,
     train_seasons: Iterable[str],
 ) -> tuple[dict, dict[str, int], list[str], dict[str, tuple[float, float]]]:
-    """Stan data for table_static.stan from historical tables + features."""
+    """Stan data for team_static.stan from historical tables + features."""
     train = tables[tables["season"].isin(list(train_seasons))].copy()
     teams = sorted(train["team"].unique())
     team_to_idx = {name: i + 1 for i, name in enumerate(teams)}
@@ -276,7 +276,7 @@ def prepare_table_stan_hierarchical(
     tables: pd.DataFrame,
     train_seasons: Iterable[str],
 ) -> tuple[dict, dict[str, int], list[str], dict[str, int], dict[str, tuple[float, float]]]:
-    """Stan data for table_hierarchical.stan from historical tables + features."""
+    """Stan data for team_hierarchical.stan from historical tables + features."""
     ordered_seasons = list(train_seasons)
     season_to_idx = {s: i + 1 for i, s in enumerate(ordered_seasons)}
 
@@ -285,19 +285,13 @@ def prepare_table_stan_hierarchical(
     team_to_idx = {name: i + 1 for i, name in enumerate(teams)}
 
     train, feature_stats = _standardize_features(train)
-    train["obs_pos"] = train.groupby("season").cumcount() + 1
-    season_counts = train.groupby("season").size()
-    if season_counts.nunique() != 1:
-        raise ValueError("table_hierarchical.stan expects equal teams per season")
 
     stan_data = {
         "N": len(train),
         "S": len(ordered_seasons),
         "T": len(teams),
-        "K": int(season_counts.iloc[0]),
         "nu": STUDENT_T_NU,
         "season": train["season"].map(season_to_idx).astype(int).to_numpy(),
-        "obs_pos": train["obs_pos"].astype(int).to_numpy(),
         "team": train["team"].map(team_to_idx).astype(int).to_numpy(),
         "pts": train["Pts"].astype(float).to_numpy(),
         "sot_diff_pg": train["sot_diff_pg"].astype(float).to_numpy(),
@@ -360,30 +354,29 @@ def ppc_table_replicates(
     return mu + noise
 
 
-def predict_table(
+def predict_team_points(
     fit,
-    teams: list[str],
+    team: str,
     team_to_idx: dict[str, int],
     *,
     model: str = "static",
-    last_season_index: int | None = None,
-    team_features: dict[str, dict[str, float]] | None = None,
+    team_features: dict[str, float] | None = None,
     n_sims: int = 500,
     seed: int = 42,
-) -> pd.DataFrame:
+) -> dict[str, float | np.ndarray]:
     """
-    Predict a full league table from a fitted **table-level** Stan model.
+    Posterior predictive points for **one team** (model input = single club).
 
-    Samples posterior predictive points per team, ranks into positions.
-    Teams not in training index get skill = 0 (mid-table prior).
-    Pass z-scored covariates via team_features (from build_forecast_features).
+    Model 1 (static): ``beta_pts * skill[team]`` — one latent strength over all seasons.
 
-    Returns summary with pos_median, pts_median, etc.
+    Model 2 (hierarchical): ``team_skill[team] + tau_season * z`` with fresh
+    ``z ~ N(0, 1)`` for the forecast season (new season deviation, not the mean
+    of historical ``skill[s, team]``).
+
+    Returns summary stats and optional replicate array.
     """
     if model not in {"static", "hierarchical"}:
         raise ValueError("model must be 'static' or 'hierarchical'")
-    if model == "hierarchical" and last_season_index is None:
-        raise ValueError("last_season_index required for hierarchical model")
 
     zero_feat = {
         "sot_diff_pg": 0.0,
@@ -391,6 +384,7 @@ def predict_table(
         "ppg_last10": 0.0,
         "is_promoted": 0.0,
     }
+    feat = team_features or zero_feat
 
     rng = np.random.default_rng(seed)
     intercept = fit.stan_variable("intercept")
@@ -401,9 +395,9 @@ def predict_table(
     sigma_pts = fit.stan_variable("sigma_pts")
     n_draws = intercept.shape[0]
 
-    skill_draws = fit.stan_variable("skill")
-    beta_pts_draws = (
-        fit.stan_variable("beta_pts") if model == "static" else None
+    beta_pts_draws = fit.stan_variable("beta_pts") if model == "static" else None
+    static_skill_draws = (
+        fit.stan_variable("skill") if model == "static" else None
     )
     team_skill_draws = (
         fit.stan_variable("team_skill") if model == "hierarchical" else None
@@ -412,236 +406,262 @@ def predict_table(
         fit.stan_variable("tau_season") if model == "hierarchical" else None
     )
 
-    position_records = {t: [] for t in teams}
-    points_records = {t: [] for t in teams}
-
-    for _ in range(n_sims):
+    sims = np.empty(n_sims, dtype=float)
+    for i in range(n_sims):
         d = rng.integers(0, n_draws)
-        sim_pts: dict[str, float] = {}
-        if model == "hierarchical":
-            future_dev_z = rng.standard_normal(len(teams))
-            future_dev_z = future_dev_z - future_dev_z.mean()
-            future_dev = tau_season_draws[d] * future_dev_z
-        else:
-            future_dev = np.zeros(len(teams))
-
-        for team_pos, team in enumerate(teams):
-            if team in team_to_idx:
-                j = team_to_idx[team] - 1
-                if model == "static":
-                    team_skill = beta_pts_draws[d] * skill_draws[d, j]
-                else:
-                    team_skill = team_skill_draws[d, j] + future_dev[team_pos]
+        if team in team_to_idx:
+            j = team_to_idx[team] - 1
+            if model == "static":
+                team_skill = beta_pts_draws[d] * static_skill_draws[d, j]
             else:
-                team_skill = future_dev[team_pos] if model == "hierarchical" else 0.0
+                season_dev = tau_season_draws[d] * rng.standard_normal()
+                team_skill = team_skill_draws[d, j] + season_dev
+        else:
+            if model == "hierarchical":
+                season_dev = tau_season_draws[d] * rng.standard_normal()
+                team_skill = season_dev
+            else:
+                team_skill = 0.0
 
-            feat = (team_features or {}).get(team, zero_feat)
-            mu = (
-                intercept[d]
-                + team_skill
-                + beta_sot[d] * feat["sot_diff_pg"]
-                + beta_lag[d] * feat["pts_lag1"]
-                + beta_form[d] * feat["ppg_last10"]
-                + beta_promoted[d] * feat.get("is_promoted", 0.0)
-            )
-            sim_pts[team] = mu + sigma_pts[d] * rng.standard_t(STUDENT_T_NU)
-
-        ranked = (
-            pd.DataFrame({"team": teams, "Pts": [sim_pts[t] for t in teams]})
-            .sort_values(["Pts"], ascending=False)
+        mu = (
+            intercept[d]
+            + team_skill
+            + beta_sot[d] * feat["sot_diff_pg"]
+            + beta_lag[d] * feat["pts_lag1"]
+            + beta_form[d] * feat["ppg_last10"]
+            + beta_promoted[d] * feat.get("is_promoted", 0.0)
         )
-        ranked["position"] = np.arange(1, len(ranked) + 1)
-        for _, row in ranked.iterrows():
-            position_records[row["team"]].append(int(row["position"]))
-            points_records[row["team"]].append(float(row["Pts"]))
+        sims[i] = mu + sigma_pts[d] * rng.standard_t(STUDENT_T_NU)
 
-    summary = pd.DataFrame({"team": teams})
-    summary["pos_median"] = [np.median(position_records[t]) for t in teams]
-    summary["pos_mean"] = [np.mean(position_records[t]) for t in teams]
-    summary["pts_median"] = [np.median(points_records[t]) for t in teams]
-    summary["pts_mean"] = [np.mean(points_records[t]) for t in teams]
-    return summary.sort_values("pos_median").reset_index(drop=True)
-
-
-def prepare_stan_data(matches: pd.DataFrame,train_seasons: Iterable[str]) -> tuple[dict, dict[str, int], list[str]]:
-    """
-    Build Stan data dict (1-based team indices) from training seasons only.
-
-    Returns (stan_data, team_to_idx, team_names).
-    """
-    train = matches[matches["season"].isin(list(train_seasons))].copy()
-    teams = sorted(set(train["HomeTeam"]) | set(train["AwayTeam"]))
-    team_to_idx = {name: i + 1 for i, name in enumerate(teams)}  # Stan is 1-based
-
-    home = train["HomeTeam"].map(team_to_idx).to_numpy()
-    away = train["AwayTeam"].map(team_to_idx).to_numpy()
-
-    stan_data = {
-        "N": len(train),
-        "T": len(teams),
-        "home": home.astype(int),
-        "away": away.astype(int),
-        "goals_h": train["FTHG"].astype(int).to_numpy(),
-        "goals_a": train["FTAG"].astype(int).to_numpy(),
+    return {
+        "team": team,
+        "pts_mean": float(np.mean(sims)),
+        "pts_median": float(np.median(sims)),
+        "pts_q05": float(np.quantile(sims, 0.05)),
+        "pts_q95": float(np.quantile(sims, 0.95)),
+        "pts_sims": sims,
     }
-    return stan_data, team_to_idx, teams
 
 
-def prepare_stan_data_hierarchical(
-    matches: pd.DataFrame,
-    train_seasons: Iterable[str],
-) -> tuple[dict, dict[str, int], list[str], dict[str, int]]:
-    """
-    Stan data with per-match season index (1-based).
-
-    Returns (stan_data, team_to_idx, team_names, season_to_idx).
-    """
-    ordered_seasons = list(train_seasons)
-    season_to_idx = {s: i + 1 for i, s in enumerate(ordered_seasons)}
-
-    train = matches[matches["season"].isin(ordered_seasons)].copy()
-    teams = sorted(set(train["HomeTeam"]) | set(train["AwayTeam"]))
-    team_to_idx = {name: i + 1 for i, name in enumerate(teams)}
-
-    stan_data = {
-        "N": len(train),
-        "S": len(ordered_seasons),
-        "T": len(teams),
-        "season": train["season"].map(season_to_idx).astype(int).to_numpy(),
-        "home": train["HomeTeam"].map(team_to_idx).astype(int).to_numpy(),
-        "away": train["AwayTeam"].map(team_to_idx).astype(int).to_numpy(),
-        "goals_h": train["FTHG"].astype(int).to_numpy(),
-        "goals_a": train["FTAG"].astype(int).to_numpy(),
-    }
-    return stan_data, team_to_idx, teams, season_to_idx
-
-
-def simulate_seasons_from_hierarchical_draws(
+def build_predicted_table(
     fit,
     teams: list[str],
     team_to_idx: dict[str, int],
-    last_season_index: int,
-    n_table_sims: int = 500,
+    *,
+    model: str = "static",
+    team_features: dict[str, dict[str, float]] | None = None,
+    n_sims: int = 500,
     seed: int = 42,
 ) -> pd.DataFrame:
     """
-    Forecast using attack/defense from the last training season (Stan index S).
+    Build a league table by predicting points for each team separately, then ranking.
+
+    Each team is an independent model input; position comes from sorting predicted points.
+    Model 1 uses static ``beta_pts * skill``; Model 2 uses ``team_skill + tau_season * z``
+    with a fresh season draw ``z`` per simulation.
     """
-    rng = np.random.default_rng(seed)
-    att_draws = fit.stan_variable("att")  # (draws, S, T)
-    def_draws = fit.stan_variable("def")
-    home_adv_draws = fit.stan_variable("home_adv")
-
-    s_idx = last_season_index - 1  # 0-based slice for last season
-    n_draws = att_draws.shape[0]
-
-    position_records = {t: [] for t in teams}
-    points_records = {t: [] for t in teams}
-
-    for _ in range(n_table_sims):
-        d = rng.integers(0, n_draws)
-        att = {t: 0.0 for t in teams}
-        def_ = {t: 0.0 for t in teams}
-        for team in teams:
-            if team in team_to_idx:
-                j = team_to_idx[team] - 1
-                att[team] = att_draws[d, s_idx, j]
-                def_[team] = def_draws[d, s_idx, j]
-
-        table = simulate_season_table(teams, att, def_, home_adv_draws[d], rng)
-        for _, row in table.iterrows():
-            position_records[row["team"]].append(row["position"])
-            points_records[row["team"]].append(row["Pts"])
-
-    summary = pd.DataFrame({"team": teams})
-    summary["pos_median"] = [np.median(position_records[t]) for t in teams]
-    summary["pos_mean"] = [np.mean(position_records[t]) for t in teams]
-    summary["pts_median"] = [np.median(points_records[t]) for t in teams]
-    summary["pts_mean"] = [np.mean(points_records[t]) for t in teams]
-    return summary.sort_values("pos_median").reset_index(drop=True)
-
-
-def season_fixture_pairs(teams: list[str]) -> list[tuple[str, str]]:
-    """Round-robin home/away fixtures (each pair plays twice)."""
-    pairs = []
-    for i, home in enumerate(teams):
-        for j, away in enumerate(teams):
-            if i != j:
-                pairs.append((home, away))
-    return pairs
-
-
-def simulate_match_goals(att_h, def_h, att_a, def_a, home_adv, rng):
-    log_lam_h = home_adv + att_h - def_a
-    log_lam_a = att_a - def_h
-    return rng.poisson(np.exp(log_lam_h)), rng.poisson(np.exp(log_lam_a))
-
-
-def simulate_season_table(teams: list[str], att: dict[str, float], def_: dict[str, float], home_adv: float, rng: np.random.Generator) -> pd.DataFrame:
-    """Simulate one full double round-robin and return league table."""
-    tab = {t: {"Pts": 0, "GF": 0, "GA": 0} for t in teams}
-    for home, away in season_fixture_pairs(teams):
-        gh, ga = simulate_match_goals(
-            att[home], def_[home], att[away], def_[away], home_adv, rng
+    rows = []
+    for i, team in enumerate(teams):
+        feat = (team_features or {}).get(team)
+        pred = predict_team_points(
+            fit,
+            team,
+            team_to_idx,
+            model=model,
+            team_features=feat,
+            n_sims=n_sims,
+            seed=seed + i,
         )
-        tab[home]["GF"] += gh
-        tab[home]["GA"] += ga
-        tab[away]["GF"] += ga
-        tab[away]["GA"] += gh
-        if gh > ga:
-            tab[home]["Pts"] += 3
-        elif gh < ga:
-            tab[away]["Pts"] += 3
-        else:
-            tab[home]["Pts"] += 1
-            tab[away]["Pts"] += 1
+        rows.append({
+            "team": team,
+            "pts_median": pred["pts_median"],
+            "pts_mean": pred["pts_mean"],
+            "pts_q05": pred["pts_q05"],
+            "pts_q95": pred["pts_q95"],
+        })
 
-    rows = [
-        {"team": t, "Pts": p["Pts"], "GD": p["GF"] - p["GA"], "GF": p["GF"], "GA": p["GA"]}
-        for t, p in tab.items()
+    summary = pd.DataFrame(rows).sort_values(
+        ["pts_median", "pts_mean"], ascending=False
+    )
+    summary["pos_median"] = np.arange(1, len(summary) + 1)
+    summary["pos_mean"] = summary["pts_mean"].rank(ascending=False, method="average")
+    return summary.reset_index(drop=True)
+
+
+def compare_forecast_to_actual(
+    pred_table: pd.DataFrame,
+    matches: pd.DataFrame,
+    season: str,
+) -> pd.DataFrame:
+    """
+    Merge predicted league table with actual season results.
+
+    Adds `pos_error` and `pts_error` as predicted minus actual
+    (negative = model under-predicted).
+    """
+    actual = compute_table(matches, season)[["team", "position", "Pts"]]
+    actual = actual.rename(columns={"position": "pos_actual", "Pts": "pts_actual"})
+    comparison = pred_table.merge(actual, on="team", how="left")
+    comparison["pos_error"] = comparison["pos_median"] - comparison["pos_actual"]
+    comparison["pts_error"] = comparison["pts_median"] - comparison["pts_actual"]
+    comparison["pos_abs_error"] = comparison["pos_error"].abs()
+    comparison["pts_abs_error"] = comparison["pts_error"].abs()
+    return comparison
+
+
+def forecast_team_errors(comparison: pd.DataFrame) -> pd.DataFrame:
+    """Per-team point/position errors, sorted by absolute point error."""
+    cols = [
+        "team",
+        "pts_median",
+        "pts_actual",
+        "pts_error",
+        "pts_abs_error",
+        "pos_median",
+        "pos_actual",
+        "pos_error",
+        "pos_abs_error",
     ]
-    out = pd.DataFrame(rows).sort_values(["Pts", "GD", "GF"], ascending=False)
-    out["position"] = np.arange(1, len(out) + 1)
-    return out.reset_index(drop=True)
+    if "test_season" in comparison.columns:
+        cols = ["test_season"] + cols
+    return comparison[cols].sort_values("pts_abs_error", ascending=False)
 
 
-def simulate_seasons_from_draws(fit, teams: list[str], team_to_idx: dict[str, int], n_table_sims: int = 500, seed: int = 42) -> pd.DataFrame:
+def forecast_season_summary(comparison: pd.DataFrame) -> pd.Series:
     """
-    Simulate many season tables using posterior draws from CmdStanPy fit.
-    Unknown teams (not in training index) get att=0, def=0.
+    Season-level backtest metrics from `compare_forecast_to_actual` output.
+
+    Returns mean predicted/actual points, MAE, and total absolute error.
     """
-    rng = np.random.default_rng(seed)
-    att_draws = fit.stan_variable("att")  # (draws, T)
-    def_draws = fit.stan_variable("def")
-    home_adv_draws = fit.stan_variable("home_adv")
+    return pd.Series(
+        {
+            "n_teams": len(comparison),
+            "pts_pred_mean": comparison["pts_median"].mean(),
+            "pts_actual_mean": comparison["pts_actual"].mean(),
+            "pts_mae": comparison["pts_abs_error"].mean(),
+            "pts_abs_error_sum": comparison["pts_abs_error"].sum(),
+            "pts_bias": comparison["pts_error"].mean(),
+            "pos_mae": comparison["pos_abs_error"].mean(),
+            "pos_abs_error_sum": comparison["pos_abs_error"].sum(),
+            "pos_bias": comparison["pos_error"].mean(),
+        }
+    )
 
-    n_draws = att_draws.shape[0]
-    idx_to_team = {idx: name for name, idx in team_to_idx.items()}
 
-    position_records = {t: [] for t in teams}
-    points_records = {t: [] for t in teams}
+def print_forecast_season_summary(
+    summary: pd.Series,
+    *,
+    season: str | None = None,
+    title: str = "Point forecast quality",
+) -> None:
+    """Print season totals and mean absolute error per team (sum / n_teams)."""
+    n_teams = int(summary["n_teams"])
+    pts_sum = float(summary["pts_abs_error_sum"])
+    pts_mean = pts_sum / n_teams
+    pos_sum = float(summary["pos_abs_error_sum"])
+    pos_mean = pos_sum / n_teams
+    season_label = f"Season {season} — " if season else ""
 
-    for _ in range(n_table_sims):
-        d = rng.integers(0, n_draws)
-        att = {t: 0.0 for t in teams}
-        def_ = {t: 0.0 for t in teams}
-        for team in teams:
-            if team in team_to_idx:
-                j = team_to_idx[team] - 1
-                att[team] = att_draws[d, j]
-                def_[team] = def_draws[d, j]
+    print(f"{season_label}{title}")
+    print(f"  Sum |point error| over all teams:  {pts_sum:.0f} pts")
+    print(f"  Mean |point error| per team:        {pts_mean:.2f} pts  ({pts_sum:.0f} / {n_teams})")
+    print(f"  Mean signed point error (bias):     {summary['pts_bias']:+.2f} pts")
+    print(f"  Mean predicted / actual points:     {summary['pts_pred_mean']:.1f} / {summary['pts_actual_mean']:.1f}")
+    print(f"  Sum |position error|:               {pos_sum:.0f} places")
+    print(f"  Mean |position error| per team:     {pos_mean:.2f} places  ({pos_sum:.0f} / {n_teams})")
 
-        table = simulate_season_table(teams, att, def_, home_adv_draws[d], rng)
-        for _, row in table.iterrows():
-            position_records[row["team"]].append(row["position"])
-            points_records[row["team"]].append(row["Pts"])
 
-    summary = pd.DataFrame({"team": teams})
-    summary["pos_median"] = [np.median(position_records[t]) for t in teams]
-    summary["pos_mean"] = [np.mean(position_records[t]) for t in teams]
-    summary["pts_median"] = [np.median(points_records[t]) for t in teams]
-    summary["pts_mean"] = [np.mean(points_records[t]) for t in teams]
-    return summary.sort_values("pos_median").reset_index(drop=True)
+def plot_forecast_team_errors(
+    comparison: pd.DataFrame,
+    *,
+    season: str | None = None,
+    title: str | None = None,
+    ax=None,
+):
+    """
+    Bar chart of signed and absolute point errors per team.
+
+    Returns (fig, axes). Red = model over-predicted; blue = under-predicted.
+    """
+    import matplotlib.pyplot as plt
+
+    data = forecast_team_errors(comparison).sort_values("pts_abs_error", ascending=True)
+    season_label = season or (
+        str(comparison["test_season"].iloc[0])
+        if "test_season" in comparison.columns
+        else ""
+    )
+    plot_title = title or f"Point forecast errors{f' — {season_label}' if season_label else ''}"
+
+    if ax is None:
+        fig, axes = plt.subplots(1, 2, figsize=(14, max(5, 0.35 * len(data))))
+    else:
+        fig = ax.figure
+        axes = [ax] if not hasattr(ax, "__len__") else ax
+
+    colors = np.where(data["pts_error"] >= 0, "tomato", "steelblue")
+    axes[0].barh(data["team"], data["pts_error"], color=colors, alpha=0.85)
+    axes[0].axvline(0, color="black", lw=0.8)
+    axes[0].set_xlabel("Point error (predicted − actual)")
+    axes[0].set_title("Signed error per team")
+
+    axes[1].barh(data["team"], data["pts_abs_error"], color="gray", alpha=0.75)
+    axes[1].set_xlabel("|Point error|")
+    axes[1].set_title("Absolute error per team")
+
+    summary = forecast_season_summary(comparison)
+    n_teams = int(summary["n_teams"])
+    pts_sum = float(summary["pts_abs_error_sum"])
+    pts_mean = pts_sum / n_teams
+    fig.suptitle(
+        f"{plot_title}\n"
+        f"sum |error| = {pts_sum:.0f} pkt | "
+        f"mean per team = {pts_mean:.2f} pkt ({pts_sum:.0f} / {n_teams})",
+        fontsize=11,
+        y=1.02,
+    )
+    fig.tight_layout()
+    return fig, axes
+
+
+def summarize_models(comparisons: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Overall table metrics for one or more fitted models."""
+    return pd.DataFrame(
+        {name: forecast_season_summary(cmp) for name, cmp in comparisons.items()}
+    )
+
+
+def compare_models_team_errors(
+    comparison_a: pd.DataFrame,
+    comparison_b: pd.DataFrame,
+    *,
+    label_a: str = "m1",
+    label_b: str = "m2",
+) -> pd.DataFrame:
+    """Side-by-side per-team absolute point errors for two models."""
+    a = forecast_team_errors(comparison_a)[
+        ["team", "pts_error", "pts_abs_error", "pos_abs_error"]
+    ].rename(
+        columns={
+            "pts_error": f"pts_error_{label_a}",
+            "pts_abs_error": f"pts_abs_error_{label_a}",
+            "pos_abs_error": f"pos_abs_error_{label_a}",
+        }
+    )
+    b = forecast_team_errors(comparison_b)[
+        ["team", "pts_error", "pts_abs_error", "pos_abs_error"]
+    ].rename(
+        columns={
+            "pts_error": f"pts_error_{label_b}",
+            "pts_abs_error": f"pts_abs_error_{label_b}",
+            "pos_abs_error": f"pos_abs_error_{label_b}",
+        }
+    )
+    merged = a.merge(b, on="team", how="outer")
+    merged[f"pts_abs_error_diff_{label_a}_minus_{label_b}"] = (
+        merged[f"pts_abs_error_{label_a}"] - merged[f"pts_abs_error_{label_b}"]
+    )
+    return merged.sort_values(f"pts_abs_error_{label_a}", ascending=False)
 
 
 def compute_table(df, season):
