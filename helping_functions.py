@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_DATA_PATH = Path(__file__).resolve().parent / "Data" / "datahub.io"
+STUDENT_T_NU = 5.0  # fixed df in table Stan models (robust regression default)
 
 
 def load_matches(data_path: Path | None = None) -> pd.DataFrame:
@@ -21,6 +22,445 @@ def load_matches(data_path: Path | None = None) -> pd.DataFrame:
     matches["Date"] = pd.to_datetime(matches["Date"])
     matches["total_goals"] = matches["FTHG"] + matches["FTAG"]
     return matches
+
+
+TABLE_FEATURE_COLS = ("sot_diff_pg", "pts_lag1", "ppg_last10")
+
+
+def compute_team_season_features(
+    matches: pd.DataFrame,
+    season: str,
+    ordered_seasons: Iterable[str],
+    pts_by_season_team: dict[tuple[str, str], float] | None = None,
+) -> pd.DataFrame:
+    """
+    Process features per team for one season (from match-level CSV).
+
+    - sot_diff_pg: (shots on target for − against) per match
+    - pts_lag1: points in the previous season (0 if promoted / first season)
+    - ppg_last10: points per game over the last 10 league matches
+    """
+    ordered = list(ordered_seasons)
+    s = matches[matches["season"] == season].sort_values("Date")
+    teams = sorted(set(s["HomeTeam"]) | set(s["AwayTeam"]))
+
+    sot_for: dict[str, float] = {t: 0.0 for t in teams}
+    sot_against: dict[str, float] = {t: 0.0 for t in teams}
+    match_pts: dict[str, list[float]] = {t: [] for t in teams}
+    n_games: dict[str, int] = {t: 0 for t in teams}
+
+    for _, r in s.iterrows():
+        h, a = r["HomeTeam"], r["AwayTeam"]
+        sot_for[h] += float(r["HST"])
+        sot_against[h] += float(r["AST"])
+        sot_for[a] += float(r["AST"])
+        sot_against[a] += float(r["HST"])
+
+        if r["FTR"] == "H":
+            match_pts[h].append(3.0)
+            match_pts[a].append(0.0)
+        elif r["FTR"] == "A":
+            match_pts[h].append(0.0)
+            match_pts[a].append(3.0)
+        else:
+            match_pts[h].append(1.0)
+            match_pts[a].append(1.0)
+        n_games[h] += 1
+        n_games[a] += 1
+
+    prev_season = None
+    if season in ordered:
+        idx = ordered.index(season)
+        if idx > 0:
+            prev_season = ordered[idx - 1]
+
+    if pts_by_season_team is None:
+        pts_by_season_team = {}
+        if prev_season is not None:
+            prev_tab = compute_table(matches, prev_season)
+            for _, row in prev_tab.iterrows():
+                pts_by_season_team[(prev_season, row["team"])] = float(row["Pts"])
+
+    rows = []
+    for team in teams:
+        ng = max(n_games[team], 1)
+        sot_diff_pg = (sot_for[team] - sot_against[team]) / ng
+        last10 = match_pts[team][-10:]
+        ppg_last10 = float(np.mean(last10)) if last10 else 0.0
+        if prev_season is None:
+            pts_lag1 = 0.0
+        else:
+            pts_lag1 = pts_by_season_team.get((prev_season, team), 0.0)
+
+        rows.append({
+            "season": season,
+            "team": team,
+            "sot_diff_pg": sot_diff_pg,
+            "pts_lag1": pts_lag1,
+            "ppg_last10": ppg_last10,
+        })
+    return pd.DataFrame(rows)
+
+
+def _standardize_features(
+    df: pd.DataFrame,
+    cols: Iterable[str] = TABLE_FEATURE_COLS,
+    stats: dict[str, tuple[float, float]] | None = None,
+) -> tuple[pd.DataFrame, dict[str, tuple[float, float]]]:
+    """Z-score feature columns; return updated frame and (mean, std) per column."""
+    out = df.copy()
+    if stats is None:
+        stats = {}
+        for col in cols:
+            mu = float(out[col].mean())
+            sd = float(out[col].std())
+            if sd <= 0:
+                sd = 1.0
+            stats[col] = (mu, sd)
+    for col in cols:
+        mu, sd = stats[col]
+        out[col] = (out[col] - mu) / sd
+    return out, stats
+
+
+def load_season_tables(
+    matches: pd.DataFrame,
+    seasons: Iterable[str],
+    *,
+    with_features: bool = True,
+    lag_features: bool = True,
+) -> pd.DataFrame:
+    """Long-format league tables: one row per (season, team), optional process features.
+
+    With lag_features=True, features for target season s are taken from season s-1.
+    That avoids leaking same-season shots/form into a pre-season table forecast.
+    """
+    ordered = sorted(seasons)
+    frames = []
+    pts_lookup: dict[tuple[str, str], float] = {}
+    for season in ordered:
+        tab = compute_table(matches, season)
+        for _, row in tab.iterrows():
+            pts_lookup[(season, row["team"])] = float(row["Pts"])
+        tab = tab.assign(season=season)
+        frames.append(tab)
+    tables = pd.concat(frames, ignore_index=True)
+
+    if not with_features:
+        return tables
+
+    raw_feat_frames = [
+        compute_team_season_features(matches, season, ordered, pts_lookup)
+        for season in ordered
+    ]
+    raw_features = pd.concat(raw_feat_frames, ignore_index=True)
+
+    if not lag_features:
+        return tables.merge(raw_features, on=["season", "team"], how="left")
+
+    raw_by_season_team = raw_features.set_index(["season", "team"])
+    rows = []
+    for _, row in tables[["season", "team"]].iterrows():
+        season = row["season"]
+        team = row["team"]
+        season_idx = ordered.index(season)
+        if season_idx == 0:
+            feature_row = {
+                "season": season,
+                "team": team,
+                "sot_diff_pg": 0.0,
+                "pts_lag1": 0.0,
+                "ppg_last10": 0.0,
+                "is_promoted": 0,
+            }
+        else:
+            prev_season = ordered[season_idx - 1]
+            if (prev_season, team) in raw_by_season_team.index:
+                prev = raw_by_season_team.loc[(prev_season, team)]
+                feature_row = {
+                    "season": season,
+                    "team": team,
+                    "sot_diff_pg": float(prev["sot_diff_pg"]),
+                    "pts_lag1": float(pts_lookup.get((prev_season, team), 0.0)),
+                    "ppg_last10": float(prev["ppg_last10"]),
+                    "is_promoted": 0,
+                }
+            else:
+                feature_row = {
+                    "season": season,
+                    "team": team,
+                    "sot_diff_pg": 0.0,
+                    "pts_lag1": 0.0,
+                    "ppg_last10": 0.0,
+                    "is_promoted": 1,
+                }
+        rows.append(feature_row)
+    features = pd.DataFrame(rows)
+    return tables.merge(features, on=["season", "team"], how="left")
+
+
+def build_forecast_features(
+    matches: pd.DataFrame,
+    feature_season: str,
+    teams: list[str],
+    ordered_seasons: Iterable[str],
+    feature_stats: dict[str, tuple[float, float]],
+) -> dict[str, dict[str, float]]:
+    """
+    Covariates for forecast teams from one reference season (z-scored).
+
+    Teams absent in feature_season get 0 on the z-scale (training mean).
+    """
+    ordered = list(ordered_seasons)
+    feat = compute_team_season_features(matches, feature_season, ordered)
+    feat = feat.set_index("team")
+    pts_last = compute_table(matches, feature_season).set_index("team")["Pts"]
+    raw_rows = []
+    for team in teams:
+        if team in feat.index:
+            row = feat.loc[team]
+            raw_rows.append({
+                "team": team,
+                "sot_diff_pg": float(row["sot_diff_pg"]),
+                "pts_lag1": float(pts_last.get(team, 0.0)),
+                "ppg_last10": float(row["ppg_last10"]),
+                "is_promoted": 0,
+            })
+        else:
+            raw_rows.append({
+                "team": team,
+                "sot_diff_pg": feature_stats["sot_diff_pg"][0],
+                "pts_lag1": feature_stats["pts_lag1"][0],
+                "ppg_last10": feature_stats["ppg_last10"][0],
+                "is_promoted": 1,
+            })
+    raw_df = pd.DataFrame(raw_rows)
+    z_df, _ = _standardize_features(raw_df, stats=feature_stats)
+    return {
+        row["team"]: {
+            "sot_diff_pg": float(row["sot_diff_pg"]),
+            "pts_lag1": float(row["pts_lag1"]),
+            "ppg_last10": float(row["ppg_last10"]),
+            "is_promoted": float(row["is_promoted"]),
+        }
+        for _, row in z_df.iterrows()
+    }
+
+
+def prepare_table_stan_static(
+    tables: pd.DataFrame,
+    train_seasons: Iterable[str],
+) -> tuple[dict, dict[str, int], list[str], dict[str, tuple[float, float]]]:
+    """Stan data for table_static.stan from historical tables + features."""
+    train = tables[tables["season"].isin(list(train_seasons))].copy()
+    teams = sorted(train["team"].unique())
+    team_to_idx = {name: i + 1 for i, name in enumerate(teams)}
+
+    train, feature_stats = _standardize_features(train)
+
+    stan_data = {
+        "N": len(train),
+        "T": len(teams),
+        "nu": STUDENT_T_NU,
+        "team": train["team"].map(team_to_idx).astype(int).to_numpy(),
+        "pts": train["Pts"].astype(float).to_numpy(),
+        "sot_diff_pg": train["sot_diff_pg"].astype(float).to_numpy(),
+        "pts_lag1": train["pts_lag1"].astype(float).to_numpy(),
+        "ppg_last10": train["ppg_last10"].astype(float).to_numpy(),
+        "is_promoted": train["is_promoted"].astype(int).to_numpy(),
+    }
+    return stan_data, team_to_idx, teams, feature_stats
+
+
+def prepare_table_stan_hierarchical(
+    tables: pd.DataFrame,
+    train_seasons: Iterable[str],
+) -> tuple[dict, dict[str, int], list[str], dict[str, int], dict[str, tuple[float, float]]]:
+    """Stan data for table_hierarchical.stan from historical tables + features."""
+    ordered_seasons = list(train_seasons)
+    season_to_idx = {s: i + 1 for i, s in enumerate(ordered_seasons)}
+
+    train = tables[tables["season"].isin(ordered_seasons)].copy()
+    teams = sorted(train["team"].unique())
+    team_to_idx = {name: i + 1 for i, name in enumerate(teams)}
+
+    train, feature_stats = _standardize_features(train)
+    train["obs_pos"] = train.groupby("season").cumcount() + 1
+    season_counts = train.groupby("season").size()
+    if season_counts.nunique() != 1:
+        raise ValueError("table_hierarchical.stan expects equal teams per season")
+
+    stan_data = {
+        "N": len(train),
+        "S": len(ordered_seasons),
+        "T": len(teams),
+        "K": int(season_counts.iloc[0]),
+        "nu": STUDENT_T_NU,
+        "season": train["season"].map(season_to_idx).astype(int).to_numpy(),
+        "obs_pos": train["obs_pos"].astype(int).to_numpy(),
+        "team": train["team"].map(team_to_idx).astype(int).to_numpy(),
+        "pts": train["Pts"].astype(float).to_numpy(),
+        "sot_diff_pg": train["sot_diff_pg"].astype(float).to_numpy(),
+        "pts_lag1": train["pts_lag1"].astype(float).to_numpy(),
+        "ppg_last10": train["ppg_last10"].astype(float).to_numpy(),
+        "is_promoted": train["is_promoted"].astype(int).to_numpy(),
+    }
+    return stan_data, team_to_idx, teams, season_to_idx, feature_stats
+
+
+def ppc_table_replicates(
+    fit,
+    stan_data: dict,
+    *,
+    model: str = "static",
+    nu: float | None = None,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Posterior predictive replicates of team-season points.
+
+    Returns array with shape (n_draws, N).
+    """
+    if model not in {"static", "hierarchical"}:
+        raise ValueError("model must be 'static' or 'hierarchical'")
+
+    nu = STUDENT_T_NU if nu is None else nu
+    rng = np.random.default_rng(seed)
+
+    intercept = fit.stan_variable("intercept")
+    beta_sot = fit.stan_variable("beta_sot")
+    beta_lag = fit.stan_variable("beta_lag")
+    beta_form = fit.stan_variable("beta_form")
+    beta_promoted = fit.stan_variable("beta_promoted")
+    sigma_pts = fit.stan_variable("sigma_pts")
+    skill = fit.stan_variable("skill")
+
+    team_idx = np.asarray(stan_data["team"], dtype=int) - 1
+    sot = np.asarray(stan_data["sot_diff_pg"], dtype=float)
+    lag = np.asarray(stan_data["pts_lag1"], dtype=float)
+    form = np.asarray(stan_data["ppg_last10"], dtype=float)
+    promoted = np.asarray(stan_data["is_promoted"], dtype=float)
+
+    if model == "static":
+        beta_pts = fit.stan_variable("beta_pts")
+        sk = beta_pts[:, None] * skill[:, team_idx]
+    else:
+        season_idx = np.asarray(stan_data["season"], dtype=int) - 1
+        sk = skill[:, season_idx, team_idx]
+
+    mu = (
+        intercept[:, None]
+        + sk
+        + beta_sot[:, None] * sot[None, :]
+        + beta_lag[:, None] * lag[None, :]
+        + beta_form[:, None] * form[None, :]
+        + beta_promoted[:, None] * promoted[None, :]
+    )
+    noise = sigma_pts[:, None] * rng.standard_t(nu, size=mu.shape)
+    return mu + noise
+
+
+def predict_table(
+    fit,
+    teams: list[str],
+    team_to_idx: dict[str, int],
+    *,
+    model: str = "static",
+    last_season_index: int | None = None,
+    team_features: dict[str, dict[str, float]] | None = None,
+    n_sims: int = 500,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Predict a full league table from a fitted **table-level** Stan model.
+
+    Samples posterior predictive points per team, ranks into positions.
+    Teams not in training index get skill = 0 (mid-table prior).
+    Pass z-scored covariates via team_features (from build_forecast_features).
+
+    Returns summary with pos_median, pts_median, etc.
+    """
+    if model not in {"static", "hierarchical"}:
+        raise ValueError("model must be 'static' or 'hierarchical'")
+    if model == "hierarchical" and last_season_index is None:
+        raise ValueError("last_season_index required for hierarchical model")
+
+    zero_feat = {
+        "sot_diff_pg": 0.0,
+        "pts_lag1": 0.0,
+        "ppg_last10": 0.0,
+        "is_promoted": 0.0,
+    }
+
+    rng = np.random.default_rng(seed)
+    intercept = fit.stan_variable("intercept")
+    beta_sot = fit.stan_variable("beta_sot")
+    beta_lag = fit.stan_variable("beta_lag")
+    beta_form = fit.stan_variable("beta_form")
+    beta_promoted = fit.stan_variable("beta_promoted")
+    sigma_pts = fit.stan_variable("sigma_pts")
+    n_draws = intercept.shape[0]
+
+    skill_draws = fit.stan_variable("skill")
+    beta_pts_draws = (
+        fit.stan_variable("beta_pts") if model == "static" else None
+    )
+    team_skill_draws = (
+        fit.stan_variable("team_skill") if model == "hierarchical" else None
+    )
+    tau_season_draws = (
+        fit.stan_variable("tau_season") if model == "hierarchical" else None
+    )
+
+    position_records = {t: [] for t in teams}
+    points_records = {t: [] for t in teams}
+
+    for _ in range(n_sims):
+        d = rng.integers(0, n_draws)
+        sim_pts: dict[str, float] = {}
+        if model == "hierarchical":
+            future_dev_z = rng.standard_normal(len(teams))
+            future_dev_z = future_dev_z - future_dev_z.mean()
+            future_dev = tau_season_draws[d] * future_dev_z
+        else:
+            future_dev = np.zeros(len(teams))
+
+        for team_pos, team in enumerate(teams):
+            if team in team_to_idx:
+                j = team_to_idx[team] - 1
+                if model == "static":
+                    team_skill = beta_pts_draws[d] * skill_draws[d, j]
+                else:
+                    team_skill = team_skill_draws[d, j] + future_dev[team_pos]
+            else:
+                team_skill = future_dev[team_pos] if model == "hierarchical" else 0.0
+
+            feat = (team_features or {}).get(team, zero_feat)
+            mu = (
+                intercept[d]
+                + team_skill
+                + beta_sot[d] * feat["sot_diff_pg"]
+                + beta_lag[d] * feat["pts_lag1"]
+                + beta_form[d] * feat["ppg_last10"]
+                + beta_promoted[d] * feat.get("is_promoted", 0.0)
+            )
+            sim_pts[team] = mu + sigma_pts[d] * rng.standard_t(STUDENT_T_NU)
+
+        ranked = (
+            pd.DataFrame({"team": teams, "Pts": [sim_pts[t] for t in teams]})
+            .sort_values(["Pts"], ascending=False)
+        )
+        ranked["position"] = np.arange(1, len(ranked) + 1)
+        for _, row in ranked.iterrows():
+            position_records[row["team"]].append(int(row["position"]))
+            points_records[row["team"]].append(float(row["Pts"]))
+
+    summary = pd.DataFrame({"team": teams})
+    summary["pos_median"] = [np.median(position_records[t]) for t in teams]
+    summary["pos_mean"] = [np.mean(position_records[t]) for t in teams]
+    summary["pts_median"] = [np.median(points_records[t]) for t in teams]
+    summary["pts_mean"] = [np.mean(points_records[t]) for t in teams]
+    return summary.sort_values("pos_median").reset_index(drop=True)
 
 
 def prepare_stan_data(matches: pd.DataFrame,train_seasons: Iterable[str]) -> tuple[dict, dict[str, int], list[str]]:
