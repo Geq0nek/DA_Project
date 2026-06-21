@@ -1,48 +1,48 @@
 # Bayesian modeling of Premier League standings
 
-Projekt analityczny do probabilistycznego prognozowania liczby punktow druzyn Premier League na podstawie historycznych danych meczowych. Modele nie przewiduja pojedynczych meczow. Jednostka predykcji to jedna druzyna w jednym sezonie, a wynikiem jest rozklad punktow tej druzyny.
+This project builds probabilistic models for forecasting Premier League team points from historical match data. The models do not predict individual matches. The prediction unit is one team in one season, and the output is a full predictive distribution for that team's final points.
 
-Projekt powstal jako analiza bayesowska w Pythonie, notebookach Jupyter i Stan. Porownuje dwa podejscia:
+The analysis is implemented in Python, Jupyter notebooks, and Stan. It compares two Bayesian team-level models:
 
-- Model 1: statyczny model druzynowy z latentnym skillem klubu i cechami procesowymi.
-- Model 2: hierarchiczny model druzynowy z dlugookresowa jakoscia klubu, efektem sezonu i statusem beniaminka.
+- Model 1: a static team model with latent club skill and lagged process features.
+- Model 2: a hierarchical team model with long-run club quality, season effects, and promoted-team status.
 
-## Cel projektu
+## Project goal
 
-Celem jest zbudowanie i porownanie modeli, ktore odpowiadaja na pytania:
+The goal is to build and compare models that answer the following questions:
 
-- ile punktow moze zdobyc dana druzyna w sezonie Premier League,
-- jak duza jest niepewnosc tej prognozy,
-- czy cechy procesowe z poprzedniego sezonu poprawiaja predykcje wzgledem czystego modelu hierarchicznego,
-- jak modele wypadaja w backtescie sezonu 2025/26,
-- jak wyglada prognoza punktow na sezon 2026/27.
+- how many points a given Premier League team may score in a season,
+- how uncertain that forecast is,
+- whether lagged process features improve prediction compared with a cleaner hierarchical baseline,
+- how the models perform in a 2025/26 backtest,
+- what the points forecast looks like for the 2026/27 season.
 
-Pelna tabela ligowa jest skladana opcjonalnie przez uruchomienie predykcji punktow dla 20 druzyn i posortowanie ich po prognozowanych punktach.
+A full league table is assembled only as a derived output by running point forecasts for all 20 teams and ranking them by predicted points.
 
-## Dane
+## Data
 
-Dane znajduja sie w katalogu `Data/datahub.io` i pochodza z [datahub.io - English Premier League](https://datahub.io/football/english-premier-league), ktore agreguje dane z [football-data.co.uk](https://www.football-data.co.uk/).
+The data is stored in `Data/datahub.io` and comes from [datahub.io - English Premier League](https://datahub.io/football/english-premier-league), which aggregates data originally collected by [football-data.co.uk](https://www.football-data.co.uk/).
 
-W repo znajduja sie pliki `season-*.csv` dla sezonow od `0910` do `2526`. Kazdy wiersz oznacza jeden mecz. Najwazniejsze kolumny:
+The repository contains `season-*.csv` files for seasons from `0910` to `2526`. Each row represents one match. Key columns include:
 
-- `Date` - data meczu,
-- `HomeTeam`, `AwayTeam` - gospodarze i goscie,
-- `FTHG`, `FTAG` - gole po pelnym czasie,
-- `FTR` - wynik meczu: `H`, `D`, `A`,
-- `HST`, `AST` - strzaly celne gospodarzy i gosci,
-- dodatkowe statystyki meczowe: strzaly, faule, rozne, kartki.
+- `Date` - match date,
+- `HomeTeam`, `AwayTeam` - home and away teams,
+- `FTHG`, `FTAG` - full-time goals,
+- `FTR` - full-time result: `H`, `D`, or `A`,
+- `HST`, `AST` - home and away shots on target,
+- additional match statistics: shots, fouls, corners, and cards.
 
-Modele sa trenowane nie na poziomie meczu, ale po agregacji do tabel sezonowych: jeden wiersz oznacza pare `(season, team)` i koncowa liczbe punktow `Pts`.
+The Stan models are not trained directly on match-level rows. Match data is aggregated into season tables, where each row represents one `(season, team)` pair and the target variable is final points `Pts`.
 
-## Struktura projektu
+## Project structure
 
 ```text
 .
-├── Data/datahub.io/                  # Dane meczowe Premier League
+├── Data/datahub.io/                  # Premier League match data
 ├── stan/
-│   ├── team_static.stan              # Model 1: statyczny skill druzyny + cechy
-│   └── team_hierarchical.stan        # Model 2: model hierarchiczny
-├── helping_functions.py              # Funkcje do wczytywania danych, cech, predykcji i metryk
+│   ├── team_static.stan              # Model 1: static team skill + covariates
+│   └── team_hierarchical.stan        # Model 2: hierarchical team model
+├── helping_functions.py              # Data loading, features, prediction, and metrics
 ├── 00_project_overview_and_priors.ipynb
 ├── 01_eda_and_tables.ipynb
 ├── 02_model1_static_team.ipynb
@@ -51,58 +51,58 @@ Modele sa trenowane nie na poziomie meczu, ale po agregacji do tabel sezonowych:
 └── 05_backtest_models_comparison.ipynb
 ```
 
-## Notebooki
+## Notebooks
 
-| Plik | Opis |
+| File | Description |
 | --- | --- |
-| `00_project_overview_and_priors.ipynb` | Opis projektu, zalozenia modeli i uzasadnienie priorow. |
-| `01_eda_and_tables.ipynb` | EDA, wczytanie danych i budowa tabel sezonowych. |
-| `02_model1_static_team.ipynb` | Dopasowanie Modelu 1, diagnostyka, PPC i backtest punktow. |
-| `03_model2_hierarchical_team.ipynb` | Dopasowanie Modelu 2, diagnostyka, PPC, LOO/WAIC i backtest. |
-| `04_forecast_2627_comparison.ipynb` | Forecast sezonu 2026/27 i porownanie modeli przez LOO/WAIC. |
-| `05_backtest_models_comparison.ipynb` | Bezposredni backtest Model 1 vs Model 2 na sezonie 2025/26. |
+| `00_project_overview_and_priors.ipynb` | Project overview, model assumptions, and prior justification. |
+| `01_eda_and_tables.ipynb` | Exploratory data analysis, data loading, and season table construction. |
+| `02_model1_static_team.ipynb` | Model 1 fitting, diagnostics, PPC, and point backtest. |
+| `03_model2_hierarchical_team.ipynb` | Model 2 fitting, diagnostics, PPC, LOO/WAIC, and backtest. |
+| `04_forecast_2627_comparison.ipynb` | 2026/27 forecast and model comparison using LOO/WAIC. |
+| `05_backtest_models_comparison.ipynb` | Direct Model 1 vs Model 2 backtest on the 2025/26 season. |
 
-## Modele
+## Models
 
 ### Model 1: `team_static.stan`
 
-Model statyczny zaklada jeden latentny skill dla kazdej druzyny w calym okresie treningowym. Predykcja punktow korzysta z:
+The static model assumes one latent skill value for each team across the full training period. The point prediction uses:
 
-- indeksu druzyny,
-- `sot_diff_pg` - roznicy strzalow celnych na mecz z poprzedniego sezonu,
-- `pts_lag1` - punktow z poprzedniego sezonu,
-- `ppg_last10` - punktow na mecz w ostatnich 10 kolejkach poprzedniego sezonu,
-- `is_promoted` - informacji, czy druzyna jest beniaminkiem albo nie grala w poprzednim sezonie Premier League.
+- team index,
+- `sot_diff_pg` - shots-on-target difference per match from the previous season,
+- `pts_lag1` - points from the previous season,
+- `ppg_last10` - points per game over the final 10 matches of the previous season,
+- `is_promoted` - whether the team is promoted or absent from the previous Premier League season.
 
-Likelihood opiera sie na rozkladzie Studenta-t z ustalonym `nu = 5`, co zwieksza odpornosc modelu na nietypowe sezony.
+The likelihood uses a Student-t distribution with fixed `nu = 5`, making the model more robust to unusual seasons.
 
 ### Model 2: `team_hierarchical.stan`
 
-Model hierarchiczny nie uzywa cech procesowych w likelihoodzie. Jest baseline'em opartym na latentnej strukturze:
+The hierarchical model intentionally excludes process features from the likelihood. It acts as a baseline based on latent structure:
 
-- `team_skill` - trwala jakosc druzyny,
-- `season_effect` - wspolny efekt sezonu,
-- `is_promoted` - efekt beniaminka,
+- `team_skill` - persistent team quality,
+- `season_effect` - shared season-level effect,
+- `is_promoted` - promoted-team effect,
 - Student-t residual noise.
 
-Dzieki temu model testuje, ile da sie przewidziec sama struktura druzyn i sezonow, bez dodatkowych cech z poprzedniego sezonu.
+This model tests how much can be forecast from team and season structure alone, without additional lagged process covariates.
 
-## Pipeline analizy
+## Analysis pipeline
 
-1. Wczytanie wszystkich plikow `season-*.csv`.
-2. Dodanie kolumny `season` i parsowanie dat.
-3. Budowa tabel koncowych przez `compute_table`.
-4. Wyliczenie cech druzyna-sezon przez `load_season_tables`.
-5. Standaryzacja cech ciaglych na danych treningowych.
-6. Dopasowanie modeli Stan przez `cmdstanpy`.
-7. Diagnostyka samplera: divergences, R-hat, ESS, E-BFMI.
-8. Posterior predictive checks.
-9. Backtest sezonu 2025/26.
-10. Forecast sezonu 2026/27 i porownanie modeli.
+1. Load all `season-*.csv` files.
+2. Add the `season` column and parse match dates.
+3. Build final season tables with `compute_table`.
+4. Generate team-season features with `load_season_tables`.
+5. Standardize continuous features on the training data.
+6. Fit Stan models through `cmdstanpy`.
+7. Check sampler diagnostics: divergences, R-hat, ESS, and E-BFMI.
+8. Run posterior predictive checks.
+9. Backtest the 2025/26 season.
+10. Forecast the 2026/27 season and compare models.
 
-## Instalacja
+## Installation
 
-Projekt wymaga Pythona oraz CmdStan. Przykladowe srodowisko:
+The project requires Python and CmdStan. Example setup:
 
 ```bash
 python -m venv .venv
@@ -111,24 +111,24 @@ pip install numpy pandas matplotlib seaborn arviz cmdstanpy jupyter
 python -m cmdstanpy.install_cmdstan
 ```
 
-Po instalacji mozna uruchomic Jupyter:
+Then start Jupyter:
 
 ```bash
 jupyter lab
 ```
 
-## Uruchamianie
+## Usage
 
-Zalecana kolejnosc pracy:
+Recommended notebook order:
 
-1. `00_project_overview_and_priors.ipynb` - przeczytaj zalozenia projektu i priory.
-2. `01_eda_and_tables.ipynb` - sprawdz dane i tabele sezonowe.
-3. `02_model1_static_team.ipynb` - dopasuj Model 1.
-4. `03_model2_hierarchical_team.ipynb` - dopasuj Model 2.
-5. `05_backtest_models_comparison.ipynb` - porownaj modele na sezonie 2025/26.
-6. `04_forecast_2627_comparison.ipynb` - wykonaj forecast 2026/27 i porownanie LOO/WAIC.
+1. `00_project_overview_and_priors.ipynb` - read the assumptions and priors.
+2. `01_eda_and_tables.ipynb` - inspect the data and generated season tables.
+3. `02_model1_static_team.ipynb` - fit Model 1.
+4. `03_model2_hierarchical_team.ipynb` - fit Model 2.
+5. `05_backtest_models_comparison.ipynb` - compare the models on the 2025/26 season.
+6. `04_forecast_2627_comparison.ipynb` - run the 2026/27 forecast and LOO/WAIC comparison.
 
-Przykladowe uzycie funkcji pomocniczych:
+Example helper-function usage:
 
 ```python
 import helping_functions as hf
@@ -139,29 +139,29 @@ table_2526 = hf.compute_table(matches, "2526")
 teams_2627 = hf.pl_2627_squad(matches)
 ```
 
-## Wyniki i interpretacja
+## Results and interpretation
 
-Glownym wynikiem modelu jest rozklad punktow dla jednej druzyny:
+The main model output is a predictive distribution for one team's final points:
 
-- srednia i mediana prognozowanych punktow,
-- przedzialy niepewnosci, np. kwantyle 5% i 95%,
-- blad punktow w backtescie,
-- ranking tabeli jako pochodna prognoz punktowych.
+- mean and median predicted points,
+- uncertainty intervals, such as 5% and 95% quantiles,
+- point forecast error in backtesting,
+- league-table ranking as a derived summary of point forecasts.
 
-W obecnej wersji projektu notebook `04_forecast_2627_comparison.ipynb` wskazuje, ze PSIS-LOO faworyzuje Model 1. Model 2 pozostaje waznym punktem odniesienia, bo jest prostszym, interpretowalnym baseline'em hierarchicznym.
+In the current version, `04_forecast_2627_comparison.ipynb` reports that PSIS-LOO favors Model 1. Model 2 remains useful as a simpler and more interpretable hierarchical baseline.
 
-## Najwazniejsze funkcje
+## Key helper functions
 
-- `load_matches` - wczytuje wszystkie sezony do jednej ramki danych.
-- `compute_table` - buduje tabele ligowa dla jednego sezonu.
-- `load_season_tables` - tworzy dane druzyna-sezon z cechami.
-- `prepare_table_stan_static` - przygotowuje dane dla Modelu 1.
-- `prepare_table_stan_hierarchical` - przygotowuje dane dla Modelu 2.
-- `predict_team_points` - generuje posterior predictive points dla jednej druzyny.
-- `build_predicted_table` - sklada predykcje punktow wielu druzyn w ranking.
-- `compare_forecast_to_actual` - porownuje forecast z rzeczywista tabela.
-- `forecast_season_summary` - liczy metryki backtestu.
+- `load_matches` - loads all seasons into one DataFrame.
+- `compute_table` - builds a league table for one season.
+- `load_season_tables` - creates team-season rows with features.
+- `prepare_table_stan_static` - prepares Stan data for Model 1.
+- `prepare_table_stan_hierarchical` - prepares Stan data for Model 2.
+- `predict_team_points` - generates posterior predictive points for one team.
+- `build_predicted_table` - turns multiple team point forecasts into a ranking.
+- `compare_forecast_to_actual` - compares a forecast with the actual season table.
+- `forecast_season_summary` - computes backtest metrics.
 
-## Autorzy
+## Authors
 
-Kacper Ciesla i Tomasz Drag.
+Kacper Ciesla and Tomasz Drag.
