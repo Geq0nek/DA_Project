@@ -1,4 +1,4 @@
-// Model 1: static team strength — predict league points (Student-t likelihood)
+// Model 1 (team_static): static team strength — predict points for one team-season
 // Covariates (z-scored in Python): sot_diff_pg, pts_lag1, ppg_last10
 
 data {
@@ -29,13 +29,13 @@ transformed parameters {
 }
 
 model {
-  intercept ~ normal(52, 10);
-  beta_pts ~ normal(20, 10);
-  beta_sot ~ normal(0, 8);
-  beta_lag ~ normal(0, 0.5);
-  beta_form ~ normal(0, 8);
-  beta_promoted ~ normal(-10, 5);
-  log_sigma_pts ~ normal(log(17), 0.3);
+  intercept ~ normal(52, 15);
+  beta_pts ~ normal(10, 10);
+  beta_sot ~ normal(0, 10);
+  beta_lag ~ normal(0, 1);
+  beta_form ~ normal(0, 10);
+  beta_promoted ~ normal(-8, 8);
+  log_sigma_pts ~ normal(log(15), 0.6);
   skill ~ std_normal();
 
   for (n in 1:N) {
