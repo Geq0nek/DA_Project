@@ -296,7 +296,7 @@ def prepare_table_stan_hierarchical(
         "N": len(train),
         "S": len(ordered_seasons),
         "T": len(teams),
-        "nu": STUDENT_T_NU,
+        "nu": 2,
         "season": train["season"].map(season_to_idx).astype(int).to_numpy(),
         "team": train["team"].map(team_to_idx).astype(int).to_numpy(),
         "pts": train["Pts"].astype(float).to_numpy(),

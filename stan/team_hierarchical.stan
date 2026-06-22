@@ -4,7 +4,7 @@ data {
   int<lower=1> N;
   int<lower=1> S;
   int<lower=1> T;
-  real<lower=1> nu;  // fixed df (default 5 in Python)
+  real<lower=1> nu;  // fixed df (default 2 in Python)
   array[N] int<lower=1, upper=S> season;
   array[N] int<lower=1, upper=T> team;
   array[N] real pts;
